@@ -17,6 +17,7 @@ PLAYLIST_URL = "https://www.youtube.com/playlist?list="
 PRIORITY = "High"
 TOPIC = ["Git"]
 LOCAL_UTC_OFFSET = 2  # Adjust to your local timezone
+TEST = 2
 
 # --- INIT ---
 notion = Client(auth=NOTION_TOKEN)
