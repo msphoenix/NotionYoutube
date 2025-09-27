@@ -1,4 +1,4 @@
-"""Importing youtube video details to notion database"""
+"""Import YouTube playlist video details into a Notion database."""
 
 import subprocess
 import json
@@ -7,138 +7,173 @@ import os
 from dotenv import load_dotenv
 from notion_client import Client
 
-# Load environment variables from .env
-load_dotenv()
-
 # --- CONFIG ---
+load_dotenv()
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("DATABASE_ID")
-PLAYLIST_URL = "https://www.youtube.com/playlist?list="
+PLAYLIST_URL = (
+    "https://www.youtube.com/playlist?list=PL4cUxeGkcC9j2pbmcA93DR1A3m7VEgSxK"
+)
+
 PRIORITY = "High"
 TOPIC = ["Git"]
-LOCAL_UTC_OFFSET = 2  # Adjust to your local timezone
+LOCAL_UTC_OFFSET = 2  # Adjust if needed
 
 # --- INIT ---
 notion = Client(auth=NOTION_TOKEN)
 
-# --- STEP 1: Get flat playlist to include private videos ---
-flat_result = subprocess.run(
-    ["yt-dlp", "-J", "--flat-playlist", PLAYLIST_URL],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-flat_data = json.loads(flat_result.stdout)
-playlist_name = flat_data.get("title", "Unknown Playlist")
-flat_entries = flat_data.get("entries", [])
 
-videos = []
+def run_yt_dlp(args: list[str]) -> dict:
+    """Run yt-dlp and return parsed JSON output, or {} on failure."""
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if not result.stdout.strip():
+        return {}
 
-for index, e in enumerate(flat_entries, start=1):
-    if e is None:
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("⚠️  yt-dlp returned invalid JSON. First 500 chars:")
+        print(result.stdout[:500])
+        return {}
+
+
+def fetch_video_metadata(video_url: str) -> tuple[str | None, int | None]:
+    """Fetch upload date and duration for a single video."""
+    data = run_yt_dlp(
+        ["yt-dlp", "-J", "--skip-download", "--no-check-formats", video_url]
+    )
+    if not isinstance(data, dict):
+        return None, None
+
+    # Parse upload date
+    upload_date_str = data.get("upload_date")
+    og_added_iso = (
+        datetime.strptime(upload_date_str, "%Y%m%d").date().isoformat()
+        if upload_date_str
+        else None
+    )
+
+    return og_added_iso, data.get("duration")
+
+
+def fetch_playlist_videos(playlist_url: str) -> list[dict]:
+    """Fetch all videos (including private/unavailable) from a playlist."""
+    flat_data = run_yt_dlp(["yt-dlp", "-J", "--flat-playlist", playlist_url])
+    playlist_name = flat_data.get("title", "Unknown Playlist")
+    flat_entries = flat_data.get("entries", [])
+
+    videos = []
+
+    for _, entry in enumerate(flat_entries, start=1):
+        if not entry:  # private/unavailable video placeholder
+            videos.append(
+                {
+                    "title": f"Private Video -> {playlist_name}",
+                    "url": None,
+                    "og_added_iso": None,
+                    "length_sec": None,
+                    "private": True,
+                }
+            )
+            continue
+
+        video_id = entry.get("id")
+        video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+        raw_title = entry.get("title")
+        is_private = not raw_title or raw_title.lower() == "[private video]"
+        title = raw_title if not is_private else f"Private Video -> {playlist_name}"
+
+        og_added_iso, length_sec = (None, None)
+        if not is_private and video_url:
+            og_added_iso, length_sec = fetch_video_metadata(video_url)
+
         videos.append(
             {
-                "title": f"Private Video -> {playlist_name}",
-                "url": None,
-                "og_added_iso": None,
-                "length_sec": None,
-                "private": True,
+                "title": title,
+                "url": video_url,
+                "og_added_iso": og_added_iso,
+                "length_sec": length_sec,
+                "private": is_private,
             }
         )
-        continue
 
-    video_id = e.get("id")
-    video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
-    raw_title = e.get("title")
-    is_private = raw_title is None or raw_title.lower() == "[private video]"
-    title = (
-        raw_title if not is_private else f"Private Video #{index} -> {playlist_name}"
-    )
+    print(f"📋 Found {len(videos)} videos in playlist '{playlist_name}'.")
+    return videos, playlist_name
 
-    # OG ADDED only for public videos
-    OG_ADDED_ISO = None
-    LENGTH_SEC = None
-    if not is_private and video_url:
-        full_result = subprocess.run(
-            ["yt-dlp", "-J", video_url], capture_output=True, text=True, check=False
+
+def fetch_existing_urls(database_id: str) -> set[str]:
+    """Fetch all existing video URLs already in Notion DB."""
+    existing_urls = set()
+    next_cursor = None
+
+    while True:
+        query = notion.databases.query(
+            database_id=database_id, start_cursor=next_cursor
         )
-        full_data = json.loads(full_result.stdout)
-        upload_date_str = full_data.get("upload_date")
-        if upload_date_str:
-            OG_ADDED_ISO = (
-                datetime.strptime(upload_date_str, "%Y%m%d").date().isoformat()
-            )
-        LENGTH_SEC = full_data.get("duration")
+        for page in query["results"]:
+            url_property = page["properties"].get("URL", {})
+            if url_property.get("url"):
+                existing_urls.add(url_property["url"])
 
-    videos.append(
-        {
-            "title": title,
-            "url": video_url,
-            "og_added_iso": OG_ADDED_ISO,
-            "length_sec": LENGTH_SEC,
-            "private": is_private,
+        if not query.get("has_more"):
+            break
+        next_cursor = query["next_cursor"]
+
+    print(f"🔎 Found {len(existing_urls)} existing entries in Notion.")
+    return existing_urls
+
+
+def add_videos_to_notion(
+    videos: list[dict], playlist_name: str, existing_urls: set[str]
+) -> None:
+    """Add new videos to Notion database."""
+    added_count = 0
+
+    for v in videos:
+        if v["url"] in existing_urls:
+            print(f"⏩ Skipped (already exists): {v['title']}")
+            continue
+
+        properties = {
+            "Name": {"title": [{"text": {"content": v["title"]}}]},
+            "Priority": {"select": {"name": PRIORITY}},
+            "Topic": {"multi_select": [{"name": t} for t in TOPIC]},
+            "Playlist Name": {"rich_text": [{"text": {"content": playlist_name}}]},
         }
-    )
 
+        if v["private"]:
+            properties["Status"] = {"select": {"name": "On Hold"}}
 
-print(f"Found {len(videos)} videos in playlist (including private/unavailable).")
+        if v.get("url"):
+            properties["URL"] = {"url": v["url"]}
+        if v.get("og_added_iso"):
+            properties["OG ADDED"] = {"date": {"start": v["og_added_iso"]}}
+        if v.get("length_sec") is not None:
+            properties["Length Sec"] = {"number": v["length_sec"]}
 
-# --- STEP 3: Get existing URLs in Notion ---
-existing_urls = set()
-query = notion.databases.query(database_id=DATABASE_ID)
-for page in query["results"]:
-    url_property = page["properties"].get("URL", {})
-    if url_property.get("url"):
-        existing_urls.add(url_property["url"])
-
-print(f"Found {len(existing_urls)} existing entries in Notion.")
-
-# --- STEP 4: Add videos to Notion ---
-ADDED_COUNT = 0
-for v in videos:
-    if v["url"] in existing_urls:
-        print(f"Skipped (already exists): {v['title']}")
-        continue
-
-    # Build properties
-    properties = {
-        "Name": {"title": [{"text": {"content": v["title"]}}]},
-        "Priority": {"select": {"name": PRIORITY}},
-        "Topic": {"multi_select": [{"name": t} for t in TOPIC]},
-        "Status": {"select": {"name": "On Hold"}} if v["private"] else None,
-        "Playlist Name": {"rich_text": [{"text": {"content": playlist_name}}]},
-    }
-
-    # URL and OG ADDED
-    if v["url"]:
-        properties["URL"] = {"url": v["url"]}
-    if v.get("og_added_iso"):
-        properties["OG ADDED"] = {"date": {"start": v["og_added_iso"]}}
-    if v.get("length_sec") is not None:  # --- ADDED ---
-        properties["Length Sec"] = {"number": v["length_sec"]}
-
-    # Determine icon
-    icon = (
-        {"emoji": "🔒"}
-        if v["private"]
-        else {
-            "external": {
-                "url": "https://www.iconsdb.com/icons/preview/black/play-5-xl.png"
+        icon = (
+            {"emoji": "🔒"}
+            if v["private"]
+            else {
+                "external": {
+                    "url": "https://www.iconsdb.com/icons/preview/black/play-5-xl.png"
+                }
             }
-        }
-    )
+        )
 
-    # Remove None values (Notion API does not accept null)
-    properties = {k: v for k, v in properties.items() if v is not None}
+        notion.pages.create(
+            parent={"database_id": DATABASE_ID},
+            icon=icon,
+            properties=properties,
+        )
 
-    # Create the page in Notion
-    notion.pages.create(
-        parent={"database_id": DATABASE_ID},
-        icon=icon,
-        properties=properties,
-    )
+        print(f"✅ Added {v['title']}")
+        added_count += 1
 
-    print(f"Added {'private video' if v['private'] else ''}: {v['title']}")
-    ADDED_COUNT += 1
+    print(f"\n🎉 Done. Added {added_count} new videos to Notion.")
 
-print(f"\n✅ Done. Added {ADDED_COUNT} new videos to Notion.")
+
+if __name__ == "__main__":
+    playlist_videos, playlist_title = fetch_playlist_videos(PLAYLIST_URL)
+    notion_existing_urls = fetch_existing_urls(DATABASE_ID)
+    add_videos_to_notion(playlist_videos, playlist_title, notion_existing_urls)
